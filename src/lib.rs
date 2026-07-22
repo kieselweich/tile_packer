@@ -5,8 +5,7 @@ use image::{RgbaImage, imageops};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs,
-    path::{self, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
 const SUPPORTED_IMAGE_TYPES: &[&'static str] = &["png", "jpg", "jpeg", "webp"];
