@@ -5,10 +5,12 @@ use image::{RgbaImage, imageops};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    path::{Path, PathBuf},
+    fs,
+    path::{self, Path, PathBuf},
 };
 
 const SUPPORTED_IMAGE_TYPES: &[&'static str] = &["png", "jpg", "jpeg", "webp"];
+const DEFAULT_ATLAS_NAME: &'static str = "atlas";
 
 /// Position of a tile in the atlas, in pixels from the top-left corner.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -193,6 +195,9 @@ impl Settings {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Atlas {
     pub entries: BTreeMap<String, AtlasEntry>,
+    #[cfg(feature = "hash")]
+    #[serde(default)]
+    pub hash: u64,
 }
 
 /// The tiles sliced from one source image: their shared [`Size`] and the
@@ -211,6 +216,14 @@ impl From<(Size, Vec<Pos>)> for AtlasEntry {
             pos: value.1,
         }
     }
+}
+
+#[cfg(feature = "hash")]
+#[derive(Hash)]
+struct SheetFingerprint {
+    path: String,
+    mtime_secs: u64,
+    size: u64,
 }
 
 /// Loads [`Settings`] from a JSON file at `path`.
@@ -273,11 +286,11 @@ pub fn create_atlas(folder: &Path, settings: Settings) -> anyhow::Result<(Atlas,
     if images.is_empty() {
         return Err(anyhow!("Folder is empty: {}", folder.display()));
     }
-    let mut image_map: Vec<(Size, PathBuf)> = vec![];
+    let mut image_map: Vec<(Size, &PathBuf)> = vec![];
     // need the size to unpack the images beneath
     let default = settings.default_size;
     let compiled = settings.get_compiled_specs()?;
-    for image in images {
+    for image in &images {
         let size = compiled
             .iter()
             .find(|&ts| ts.identifier.matches(&image))
@@ -288,6 +301,9 @@ pub fn create_atlas(folder: &Path, settings: Settings) -> anyhow::Result<(Atlas,
     }
 
     image_map.sort_unstable_by(|a, b| b.0.h.cmp(&a.0.h));
+
+    #[cfg(feature = "hash")]
+    let hash = compute_atlas_hash(&images)?;
 
     let mut x_cur = 0u32;
     let mut y_cur = 0u32;
@@ -341,35 +357,181 @@ pub fn create_atlas(folder: &Path, settings: Settings) -> anyhow::Result<(Atlas,
         atlas_map.insert(name, (size, pos_list).into());
     }
 
-    Ok((Atlas { entries: atlas_map }, dest.into()))
+    Ok((
+        Atlas {
+            entries: atlas_map,
+            #[cfg(feature = "hash")]
+            hash,
+        },
+        dest.into(),
+    ))
+}
+
+#[cfg(feature = "hash")]
+fn compute_atlas_hash(images: &[PathBuf]) -> std::io::Result<u64> {
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+    };
+    let mut images: Vec<&PathBuf> = images.iter().collect();
+    images.sort();
+    let mut fingerprints = Vec::with_capacity(images.len());
+    for path in images {
+        let meta = std::fs::metadata(&path)?;
+        let mtime = meta
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        fingerprints.push(SheetFingerprint {
+            path: path.to_string_lossy().to_string(),
+            mtime_secs: mtime,
+            size: meta.len(),
+        });
+    }
+
+    let mut hasher = DefaultHasher::new();
+    fingerprints.hash(&mut hasher);
+    Ok(hasher.finish())
 }
 
 /// Builds an atlas from `folder_src` and writes it to `folder_dst` as two
 /// files: `<name>.png` (the packed image) and `<name>.json` (the [`Atlas`]
-/// metadata). `name` defaults to `"atlas"` when `None`.
+/// metadata).
+///
+/// - `settings`: pass `Some(path)` to supply the configuration directly, or
+///   `None` to load it from `folder_src/settings.json`.
+/// - `name`: base filename for the outputs; defaults to `"atlas"` when `None`.
 ///
 /// The destination folder is created if it does not exist.
 ///
 /// # Errors
 ///
-/// Propagates any error from [`create_atlas`], plus failures writing the
-/// output files.
+/// Returns an error if `settings` is `None` and `folder_src/settings.json`
+/// cannot be read, and propagates any error from [`create_atlas`] or from
+/// writing the output files.
 pub fn create_atlas_files(
     folder_src: &Path,
     folder_dst: &Path,
-    settings: Settings,
+    settings: Option<Settings>,
     name: Option<&str>,
 ) -> anyhow::Result<()> {
+    let settings = match settings {
+        Some(s) => s,
+        None => {
+            load_settings(&folder_src.join("settings.json")).context("cannot find settings.json")?
+        }
+    };
     std::fs::create_dir_all(folder_dst)?;
     let (atlas, image) = create_atlas(folder_src, settings)?;
 
+    let name = name.unwrap_or(DEFAULT_ATLAS_NAME);
     let json = serde_json::to_string(&atlas)?;
-    let name = name.unwrap_or("atlas");
     std::fs::write(folder_dst.join(format!("{name}.json")), json)?;
-
     image.save(folder_dst.join(format!("{name}.png")))?;
 
     Ok(())
+}
+
+/// Rebuilds the atlas only if the source images have changed.
+///
+/// Fingerprints the images in `folder` and compares that hash against the one
+/// stored in the atlas at `atlas_path` (see [`Atlas::hash`]).
+///
+/// - Returns `Ok(None)` if the hashes match — nothing changed, no repack.
+/// - Returns `Ok(Some((atlas, image)))` if they differ — a freshly built atlas.
+///
+/// This does not write anything; the caller decides what to do with the
+/// result. See [`create_atlas_files_on_change`] for the write-to-disk variant.
+///
+/// Only available with the `hash` feature.
+///
+/// # Errors
+///
+/// Returns an error if the source images cannot be read, if the existing atlas
+/// at `atlas_path` cannot be loaded or parsed, or if packing fails.
+#[cfg(feature = "hash")]
+pub fn create_atlas_on_changed(
+    folder: &Path,
+    atlas_path: &Path,
+    settings: Settings,
+) -> anyhow::Result<Option<(Atlas, RgbaImage)>> {
+    let images = extract_image_paths(folder)?;
+    let hash = compute_atlas_hash(&images)?;
+    let atlas = load_atlas(atlas_path)?;
+    if atlas.hash == hash {
+        return Ok(None);
+    }
+
+    let result = create_atlas(folder, settings)?;
+    Ok(Some(result))
+}
+
+#[cfg(feature = "hash")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildOutcome {
+    /// Sources changed (or no prior atlas existed); a new atlas was written.
+    Rebuilt,
+    /// Sources unchanged; existing files left untouched.
+    Unchanged,
+}
+
+/// Incrementally builds and writes the atlas, repacking only when the source
+/// images have changed since the last build.
+///
+/// If `<folder_dst>/<name>.json` exists, the sources are fingerprinted and
+/// compared against it (via [`create_atlas_on_changed`]); unchanged sources are
+/// left untouched. If no prior atlas exists, a fresh one is always built.
+///
+/// - `settings`: `Some(_)` to supply configuration directly, or `None` to load
+///   it from `folder_src/settings.json`.
+/// - `name`: base filename for the outputs; defaults to [`DEFAULT_ATLAS_NAME`].
+///
+/// Writes `<name>.png` and `<name>.json` into `folder_dst`, creating the
+/// directory if needed.
+///
+/// # Returns
+///
+/// `Ok(BuildOutcome::Rebuild)` if the atlas was (re)built and written, `Ok(BuildOutcome::Unchanged)` if the
+/// sources were unchanged and nothing was written.
+///
+/// Only available with the `hash` feature.
+///
+/// # Errors
+///
+/// Returns an error if `settings` is `None` and `folder_src/settings.json`
+/// cannot be read, if an existing atlas cannot be parsed, or if packing or
+/// writing fails.
+#[cfg(feature = "hash")]
+pub fn create_atlas_files_on_change(
+    folder_src: &Path,
+    folder_dst: &Path,
+    settings: Option<Settings>,
+    name: Option<&str>,
+) -> anyhow::Result<BuildOutcome> {
+    let settings = match settings {
+        Some(s) => s,
+        None => {
+            load_settings(&folder_src.join("settings.json")).context("cannot find settings.json")?
+        }
+    };
+    let name = name.unwrap_or(DEFAULT_ATLAS_NAME);
+    std::fs::create_dir_all(folder_dst)?;
+    let atlas_path = &folder_dst.join(format!("{name}.json"));
+    if atlas_path.exists() {
+        let Some((atlas, image)) = create_atlas_on_changed(folder_src, atlas_path, settings)?
+        else {
+            return Ok(BuildOutcome::Unchanged);
+        };
+        let json = serde_json::to_string(&atlas)?;
+        std::fs::write(folder_dst.join(format!("{name}.json")), json)?;
+        image.save(folder_dst.join(format!("{name}.png")))?;
+    } else {
+        create_atlas_files(folder_src, folder_dst, Some(settings), Some(name))?;
+    }
+
+    Ok(BuildOutcome::Rebuilt)
 }
 
 fn extract_image_paths(folder: &Path) -> anyhow::Result<Vec<PathBuf>> {
