@@ -204,6 +204,7 @@ impl Settings {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Atlas {
     pub entries: BTreeMap<String, AtlasEntry>,
+    pub size: Size,
     #[cfg(feature = "hash")]
     #[serde(default)]
     pub hash: u64,
@@ -375,6 +376,7 @@ pub fn create_atlas(folder: &Path, settings: Settings) -> anyhow::Result<(Atlas,
     Ok((
         Atlas {
             entries: atlas_map,
+            size: dest.dimensions().into(),
             #[cfg(feature = "hash")]
             hash,
         },
