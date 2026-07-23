@@ -35,22 +35,22 @@ impl From<(u32, u32)> for Pos {
 /// Matching is attempted against each file when building an atlas:
 /// - [`Stem`](NameIdentifier::Stem): matches the filename without its
 ///   extension.
-/// - [`FileName`](NameIdentifier::FileName): matches the full filename
+/// - [`FileKey`](NameIdentifier::FileKey): matches the full file key
 ///   including extension — use this to distinguish assets that share a
 ///   stem but differ in format or version.
-/// - [`Regex`](NameIdentifier::Regex): matches the full filename against a
-///   regular expression (e.g. `"big_item_.*\\.png"`).
+/// - [`Regex`](NameIdentifier::Regex): matches the full file key against a
+///   regular expression (e.g. `"big_item_.*\\"`).
 ///
 /// # JSON representation
 ///
 /// Serialized as an externally-tagged object with a `snake_case` key:
-/// `{ "stem": "..." }`, `{ "file_name": "..." }`, or `{ "regex": "..." }`.
+/// `{ "stem": "..." }`, `{ "file_key": "..." }`, or `{ "regex": "..." }`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NameIdentifier {
     Stem(String),
-    FileName(String),
     Regex(String),
+    FullKey(String),
 }
 
 #[cfg(feature = "fs")]
@@ -63,7 +63,7 @@ impl TryInto<CompiledIdentifier> for NameIdentifier {
                 regex::Regex::new(&s).with_context(|| format!("invalid regex in spec: {s:?}"))?,
             )),
             NameIdentifier::Stem(s) => Ok(CompiledIdentifier::Stem(s.clone())),
-            NameIdentifier::FileName(s) => Ok(CompiledIdentifier::FileName(s.clone())),
+            NameIdentifier::FullKey(s) => Ok(CompiledIdentifier::FullKey(s.clone())),
         }
     }
 }
@@ -72,19 +72,20 @@ impl TryInto<CompiledIdentifier> for NameIdentifier {
 #[derive(Debug, Clone)]
 enum CompiledIdentifier {
     Stem(String),
-    FileName(String),
     Regex(regex::Regex),
+    FullKey(String),
 }
 
 #[cfg(feature = "fs")]
 impl CompiledIdentifier {
-    fn matches(&self, path: &Path) -> bool {
+    fn matches(&self, name: &str) -> bool {
         match self {
-            Self::Stem(s) => path.file_stem().is_some_and(|st| st == s.as_str()),
-            Self::FileName(s) => path.file_name().is_some_and(|n| n == s.as_str()),
-            Self::Regex(re) => path
-                .file_name()
-                .is_some_and(|n| re.is_match(&n.to_string_lossy())),
+            Self::Stem(s) => {
+                let stem = name.rsplit('/').next().unwrap_or(name);
+                stem == s.as_str()
+            }
+            Self::Regex(re) => re.is_match(name),
+            CompiledIdentifier::FullKey(s) => s == name,
         }
     }
 }
@@ -183,9 +184,11 @@ struct TileSpecComp {
 /// Each entry in `specs` flattens a [`NameIdentifier`] and a [`Size`] into
 /// one object. `default_size` applies to any image no spec matches.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[cfg(feature = "fs")]
 pub struct Settings {
     pub default_size: Size,
+    /// If set the Images will collect recuse
+    #[serde(default)]
+    pub recurse: Option<RecurseSetting>,
     pub atlas_width: u32,
     pub specs: Vec<TileSpec>,
 }
@@ -195,6 +198,17 @@ impl Settings {
     fn get_compiled_specs(&self) -> anyhow::Result<Vec<TileSpecComp>> {
         self.specs.iter().map(|ts| ts.try_into()).collect()
     }
+}
+
+/// How images in subfolders are collected and named.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecurseSetting {
+    /// Subfolder path is part of the key: `ui/button.png` → `"ui/button"`.
+    FolderNaming,
+    /// Only the file stem is used: `ui/button.png` → `"button"`.
+    /// Stems must be unique across the whole tree.
+    Flat,
 }
 
 /// The result of packing: a map from image name (file stem) to that image's
@@ -231,6 +245,7 @@ impl From<(Size, Vec<Pos>)> for AtlasEntry {
 #[cfg(feature = "hash")]
 #[derive(Hash)]
 struct SheetFingerprint {
+    key: String,
     path: String,
     mtime_secs: u64,
     size: u64,
@@ -298,22 +313,25 @@ pub fn parse_atlas(json: &str) -> anyhow::Result<Atlas> {
 #[cfg(feature = "fs")]
 pub fn create_atlas(folder: &Path, settings: Settings) -> anyhow::Result<(Atlas, RgbaImage)> {
     check_healthy_settings(&settings)?;
-    let images = extract_image_paths(folder)?;
+    let images = extract_image_paths(folder, settings.recurse)?;
     if images.is_empty() {
-        return Err(anyhow!("Folder is empty: {}", folder.display()));
+        return Err(anyhow!(
+            "No supported images found in: {}",
+            folder.display()
+        ));
     }
-    let mut image_map: Vec<(Size, &PathBuf)> = vec![];
+    let mut image_map: Vec<(Size, &FoundImage)> = vec![];
     // need the size to unpack the images beneath
     let default = settings.default_size;
     let compiled = settings.get_compiled_specs()?;
     for image in &images {
         let size = compiled
             .iter()
-            .find(|&ts| ts.identifier.matches(&image))
+            .find(|&ts| ts.identifier.matches(&image.key))
             .map(|ts| ts.size)
             .unwrap_or(default);
 
-        image_map.push((size, image));
+        image_map.push((size, &image));
     }
 
     image_map.sort_unstable_by(|a, b| b.0.h.cmp(&a.0.h));
@@ -328,9 +346,9 @@ pub fn create_atlas(folder: &Path, settings: Settings) -> anyhow::Result<(Atlas,
     let mut last_height = first_height;
     let mut dest = image::RgbaImage::new(settings.atlas_width, first_height);
     // relies on tallest-first sort: first tile of a row is its tallest
-    for (size, path_buf) in image_map {
-        let dim = image::image_dimensions(&path_buf)?;
-        let path = path_buf.as_path();
+    for (size, f_image) in image_map {
+        let dim = image::image_dimensions(&f_image.path)?;
+        let path = f_image.path.as_path();
         if dim.0 % size.w != 0 || dim.1 % size.h != 0 {
             return Err(anyhow!(
                 "The dimensions on the image doesn't fits to the given size of '{:?}', image path: '{}'",
@@ -364,13 +382,14 @@ pub fn create_atlas(folder: &Path, settings: Settings) -> anyhow::Result<(Atlas,
                 x_cur += size.w;
             }
         }
-        let name: String = path.file_stem().unwrap().to_string_lossy().into();
-        if atlas_map.contains_key(&name) {
-            log::warn!(
-                "Found duplicate: '{name}' - please be sure to have only one image with the same name."
+
+        if atlas_map.contains_key(&f_image.key) {
+            log::error!(
+                "Found duplicate: '{}' - please be sure to have only one image with the same name.",
+                f_image.key
             );
         }
-        atlas_map.insert(name, (size, pos_list).into());
+        atlas_map.insert(f_image.key.clone(), (size, pos_list).into());
     }
 
     Ok((
@@ -380,21 +399,21 @@ pub fn create_atlas(folder: &Path, settings: Settings) -> anyhow::Result<(Atlas,
             #[cfg(feature = "hash")]
             hash,
         },
-        dest.into(),
+        dest,
     ))
 }
 
 #[cfg(feature = "hash")]
-fn compute_atlas_hash(images: &[PathBuf]) -> std::io::Result<u64> {
+#[cfg(feature = "hash")]
+fn compute_atlas_hash(images: &[FoundImage]) -> std::io::Result<u64> {
     use std::{
         collections::hash_map::DefaultHasher,
         hash::{Hash, Hasher},
     };
-    let mut images: Vec<&PathBuf> = images.iter().collect();
-    images.sort();
+    // `extract_image_paths` already sorts by key, so order is stable.
     let mut fingerprints = Vec::with_capacity(images.len());
-    for path in images {
-        let meta = std::fs::metadata(&path)?;
+    for img in images {
+        let meta = std::fs::metadata(&img.path)?;
         let mtime = meta
             .modified()?
             .duration_since(std::time::UNIX_EPOCH)
@@ -402,7 +421,8 @@ fn compute_atlas_hash(images: &[PathBuf]) -> std::io::Result<u64> {
             .as_secs();
 
         fingerprints.push(SheetFingerprint {
-            path: path.to_string_lossy().to_string(),
+            key: img.key.clone(),
+            path: img.path.to_string_lossy().to_string(),
             mtime_secs: mtime,
             size: meta.len(),
         });
@@ -475,15 +495,13 @@ pub fn create_atlas_on_changed(
     atlas_path: &Path,
     settings: Settings,
 ) -> anyhow::Result<Option<(Atlas, RgbaImage)>> {
-    let images = extract_image_paths(folder)?;
+    let images = extract_image_paths(folder, settings.recurse)?;
     let hash = compute_atlas_hash(&images)?;
     let atlas = load_atlas(atlas_path)?;
     if atlas.hash == hash {
         return Ok(None);
     }
-
-    let result = create_atlas(folder, settings)?;
-    Ok(Some(result))
+    Ok(Some(create_atlas(folder, settings)?))
 }
 
 #[cfg(feature = "hash")]
@@ -553,32 +571,67 @@ pub fn create_atlas_files_on_change(
 }
 
 #[cfg(feature = "fs")]
-fn extract_image_paths(folder: &Path) -> anyhow::Result<Vec<PathBuf>> {
+fn extract_image_paths(
+    folder: &Path,
+    recurse: Option<RecurseSetting>,
+) -> anyhow::Result<Vec<FoundImage>> {
     let mut images = vec![];
+    collect_into(folder, folder, recurse, &mut images)?;
+    images.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(images)
+}
+
+#[cfg(feature = "fs")]
+struct FoundImage {
+    /// Key this image will appear under in the atlas.
+    key: String,
+    path: PathBuf,
+}
+
+#[cfg(feature = "fs")]
+fn collect_into(
+    root: &Path,
+    folder: &Path,
+    recurse: Option<RecurseSetting>,
+    out: &mut Vec<FoundImage>,
+) -> anyhow::Result<()> {
     for entry in folder.read_dir()? {
         let entry = entry?;
         let path = entry.path();
 
         if path.is_dir() {
-            log::info!("found subfolder that wont be included: {}", path.display());
+            match recurse {
+                Some(_) => collect_into(root, &path, recurse, out)?,
+                None => log::info!("found subfolder that wont be included: {}", path.display()),
+            }
             continue;
         }
 
-        let ending = match path.extension() {
-            Some(end) => end,
-            None => {
-                log::info!("found file that wont be included: {}", path.display());
-                continue;
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            log::info!("found file that wont be included: {}", path.display());
+            continue;
+        };
+        if !SUPPORTED_IMAGE_TYPES.contains(&ext) {
+            log::info!("found file that wont be included: {}", path.display());
+            continue;
+        }
+
+        let key = match recurse {
+            Some(RecurseSetting::FolderNaming) => {
+                let rel = path.strip_prefix(root).unwrap_or(&path);
+                let stem = rel.with_extension("");
+                // forward slashes on every platform, so keys are portable
+                stem.components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/")
             }
+            _ => path.file_stem().unwrap().to_string_lossy().into_owned(),
         };
 
-        if SUPPORTED_IMAGE_TYPES.contains(&ending.to_str().expect("ending should support utf-8")) {
-            images.push(path);
-        } else {
-            continue;
-        }
+        out.push(FoundImage { key, path });
     }
-    return Ok(images);
+    Ok(())
 }
 
 #[cfg(feature = "fs")]
