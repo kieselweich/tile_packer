@@ -1,14 +1,17 @@
 #![doc = include_str!("../README.md")]
 
+#[cfg(feature = "fs")]
 use anyhow::{Context, anyhow};
+#[cfg(feature = "fs")]
 use image::{RgbaImage, imageops};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-};
+use std::collections::BTreeMap;
+#[cfg(feature = "fs")]
+use std::path::{Path, PathBuf};
 
+#[cfg(feature = "fs")]
 const SUPPORTED_IMAGE_TYPES: &[&'static str] = &["png", "jpg", "jpeg", "webp"];
+#[cfg(feature = "fs")]
 const DEFAULT_ATLAS_NAME: &'static str = "atlas";
 
 /// Position of a tile in the atlas, in pixels from the top-left corner.
@@ -50,6 +53,7 @@ pub enum NameIdentifier {
     Regex(String),
 }
 
+#[cfg(feature = "fs")]
 impl TryInto<CompiledIdentifier> for NameIdentifier {
     type Error = anyhow::Error;
 
@@ -64,6 +68,7 @@ impl TryInto<CompiledIdentifier> for NameIdentifier {
     }
 }
 
+#[cfg(feature = "fs")]
 #[derive(Debug, Clone)]
 enum CompiledIdentifier {
     Stem(String),
@@ -71,6 +76,7 @@ enum CompiledIdentifier {
     Regex(regex::Regex),
 }
 
+#[cfg(feature = "fs")]
 impl CompiledIdentifier {
     fn matches(&self, path: &Path) -> bool {
         match self {
@@ -137,6 +143,7 @@ impl TileSpec {
     }
 }
 
+#[cfg(feature = "fs")]
 impl TryInto<TileSpecComp> for &TileSpec {
     type Error = anyhow::Error;
 
@@ -149,6 +156,7 @@ impl TryInto<TileSpecComp> for &TileSpec {
     }
 }
 
+#[cfg(feature = "fs")]
 #[derive(Debug, Clone)]
 struct TileSpecComp {
     pub identifier: CompiledIdentifier,
@@ -175,12 +183,14 @@ struct TileSpecComp {
 /// Each entry in `specs` flattens a [`NameIdentifier`] and a [`Size`] into
 /// one object. `default_size` applies to any image no spec matches.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "fs")]
 pub struct Settings {
     pub default_size: Size,
     pub atlas_width: u32,
     pub specs: Vec<TileSpec>,
 }
 
+#[cfg(feature = "fs")]
 impl Settings {
     fn get_compiled_specs(&self) -> anyhow::Result<Vec<TileSpecComp>> {
         self.specs.iter().map(|ts| ts.try_into()).collect()
@@ -231,6 +241,7 @@ struct SheetFingerprint {
 ///
 /// Returns an error if the file cannot be read (e.g. it is missing) or if
 /// its contents are not valid `Settings` JSON.
+#[cfg(feature = "fs")]
 pub fn load_settings(path: &Path) -> anyhow::Result<Settings> {
     let settings = std::fs::read_to_string(path).context("Missing 'settings.json'")?;
     serde_json::from_str::<Settings>(&settings).context("No settings found")
@@ -246,10 +257,14 @@ pub fn load_settings(path: &Path) -> anyhow::Result<Settings> {
 ///
 /// Returns an error if the file cannot be read or its contents are not valid
 /// [`Atlas`] JSON.
+#[cfg(feature = "fs")]
 pub fn load_atlas(path: &Path) -> anyhow::Result<Atlas> {
-    let json = std::fs::read_to_string(path)?;
-    let atlas = serde_json::from_str::<Atlas>(&json)?;
-    Ok(atlas)
+    parse_atlas(&std::fs::read_to_string(path)?)
+}
+
+/// Parses an [`Atlas`] from a JSON string.
+pub fn parse_atlas(json: &str) -> anyhow::Result<Atlas> {
+    Ok(serde_json::from_str::<Atlas>(json)?)
 }
 
 /// Builds a texture atlas from every supported image in `folder`.
@@ -279,6 +294,7 @@ pub fn load_atlas(path: &Path) -> anyhow::Result<Atlas> {
 /// - a spec contains an invalid regex,
 /// - an image's dimensions are not an exact multiple of its tile size, or
 /// - an image fails to open or decode.
+#[cfg(feature = "fs")]
 pub fn create_atlas(folder: &Path, settings: Settings) -> anyhow::Result<(Atlas, RgbaImage)> {
     check_healthy_settings(&settings)?;
     let images = extract_image_paths(folder)?;
@@ -410,6 +426,7 @@ fn compute_atlas_hash(images: &[PathBuf]) -> std::io::Result<u64> {
 /// Returns an error if `settings` is `None` and `folder_src/settings.json`
 /// cannot be read, and propagates any error from [`create_atlas`] or from
 /// writing the output files.
+#[cfg(feature = "fs")]
 pub fn create_atlas_files(
     folder_src: &Path,
     folder_dst: &Path,
@@ -533,6 +550,7 @@ pub fn create_atlas_files_on_change(
     Ok(BuildOutcome::Rebuilt)
 }
 
+#[cfg(feature = "fs")]
 fn extract_image_paths(folder: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let mut images = vec![];
     for entry in folder.read_dir()? {
@@ -561,6 +579,7 @@ fn extract_image_paths(folder: &Path) -> anyhow::Result<Vec<PathBuf>> {
     return Ok(images);
 }
 
+#[cfg(feature = "fs")]
 fn check_healthy_settings(settings: &Settings) -> anyhow::Result<()> {
     let found: Vec<_> = settings
         .specs
